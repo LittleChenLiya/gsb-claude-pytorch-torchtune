@@ -8,9 +8,10 @@
 import datetime
 import os
 import time
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional, Sequence
 
 import torch
 import torch.distributed
@@ -173,6 +174,282 @@ class DummyProfiler:
 
     def step(self):
         pass
+
+    def cancel(self):
+        pass
+
+
+@dataclass(frozen=True)
+class ProfileWindow:
+    """
+    Half-open step interval ``[start_step, end_step)`` during which profiling is active.
+
+    Steps are counted the same way as ``torch.profiler.profile.step_num``: ``step()`` is
+    called at the top of an optimizer step and advances the counter from ``n`` to ``n + 1``,
+    so the *upcoming* step is indexed ``n``. A window of ``ProfileWindow(start_step=2,
+    end_step=4)`` records optimizer steps 2 and 3 only.
+
+    Attributes:
+        start_step (int): First (0-indexed) optimizer step that is recorded.
+        end_step (int): Step index at which recording stops (exclusive).
+    """
+
+    start_step: int
+    end_step: int
+
+    def __post_init__(self):
+        if self.start_step < 0:
+            raise ValueError(
+                f"ProfileWindow.start_step must be non-negative, got {self.start_step}"
+            )
+        if self.end_step <= self.start_step:
+            raise ValueError(
+                "ProfileWindow.end_step must be strictly greater than start_step, "
+                f"got start_step={self.start_step}, end_step={self.end_step}"
+            )
+
+    def contains(self, step: int) -> bool:
+        return self.start_step <= step < self.end_step
+
+    def overlaps(self, other: "ProfileWindow") -> bool:
+        # Intervals are half-open, so touching boundaries (a.end == b.start) do not
+        # overlap but are still eligible for merging in ``merge_windows``.
+        return self.start_step < other.end_step and other.start_step < self.end_step
+
+
+def merge_windows(windows: Sequence[ProfileWindow]) -> list[ProfileWindow]:
+    """
+    Merges overlapping (and directly adjacent) profiling windows into a sorted list of
+    disjoint windows.
+
+    ``[2, 5)`` and ``[4, 8)`` merge into ``[2, 8)``; ``[2, 4)`` and ``[4, 6)`` merge into
+    ``[2, 6)`` as well since the resulting recording behavior is identical. Empty input
+    returns an empty list.
+    """
+    if len(windows) == 0:
+        return []
+    sorted_windows = sorted(windows, key=lambda w: w.start_step)
+    merged = [sorted_windows[0]]
+    for window in sorted_windows[1:]:
+        current = merged[-1]
+        if window.start_step <= current.end_step:
+            merged[-1] = ProfileWindow(
+                current.start_step, max(current.end_step, window.end_step)
+            )
+        else:
+            merged.append(window)
+    return merged
+
+
+class _FakeRecordingHandle:
+    """Handle returned by recorders; ``stop()`` is idempotent."""
+
+    def __init__(self, recorder: Any):
+        self._recorder = recorder
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def stop(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._recorder.stop()
+
+
+def torch_profiler_recorder_factory(
+    activities: Optional[Sequence[torch.profiler.ProfilerActivity]] = None,
+    profile_memory: bool = False,
+    with_stack: bool = False,
+    record_shapes: bool = False,
+    with_flops: bool = False,
+    on_trace_ready: Optional[Callable[..., Any]] = None,
+) -> Callable[[], Any]:
+    """
+    Builds a zero-argument factory that lazily creates fresh ``torch.profiler.profile``
+    instances. A new instance is created *only* when a profiling window opens, so no
+    profiler / kineto records are allocated while running outside of the windows.
+
+    Windows are short and flat (no wait/warmup/active cycle), so the created profilers do
+    not take a ``schedule`` and must be explicitly stopped (``WindowedProfiler`` does this
+    on window end or on cancellation). If ``on_trace_ready`` is provided it is invoked by
+    torch profiler on ``stop()``.
+    """
+
+    if activities is None:
+        activities = [torch.profiler.ProfilerActivity.CPU]
+
+    def factory():
+        return torch.profiler.profile(
+            activities=list(activities),
+            profile_memory=profile_memory,
+            with_stack=with_stack,
+            record_shapes=record_shapes,
+            with_flops=with_flops,
+            on_trace_ready=on_trace_ready,
+        )
+
+    return factory
+
+
+class WindowedProfiler:
+    """
+    Lightweight, step-windowed wrapper around a recorder (by default ``torch.profiler.profile``).
+
+    Recorders are created lazily and exist **only** for optimizer steps that fall inside a
+    configured profiling window. Outside of every window, no recorder is constructed and
+    nothing is recorded. Overlapping (or adjacent) windows are merged up front, so each
+    step is recorded at most once.
+
+    Windows are half-open ``[start_step, end_step)`` intervals, indexed identically to
+    ``torch.profiler.profile.step_num``. Typical instrumentation mirrors
+    :class:`DummyProfiler`::
+
+        profiler = WindowedProfiler([ProfileWindow(2, 5)])
+        with profiler:
+            for batch_idx, batch in enumerate(dataloader):
+                profiler.step()  # announce optimizer step `batch_idx`
+                train.step(batch)
+        # if the run is cancelled early instead:
+        profiler.cancel()
+
+    Args:
+        windows (Sequence[ProfileWindow]): Step intervals to profile. Overlapping windows
+            are merged.
+        recorder_factory (Optional[Callable[[], Any]]): Zero-argument callable returning a
+            recorder with ``start()`` / ``stop()`` methods. Defaults to a lightweight CPU
+            ``torch.profiler.profile`` factory. Pass a custom factory (e.g. a fake
+            recorder in tests) to observe windowing behavior without kineto overhead.
+    """
+
+    def __init__(
+        self,
+        windows: Sequence[ProfileWindow],
+        recorder_factory: Optional[Callable[[], Any]] = None,
+    ):
+        self.windows: list[ProfileWindow] = merge_windows(windows)
+        self._recorder_factory = (
+            recorder_factory
+            if recorder_factory is not None
+            else torch_profiler_recorder_factory()
+        )
+        # Step that will run next; `step()` announces this step before it executes.
+        self._step_num = 0
+        # Index into self.windows of the earliest window not yet entered.
+        self._cursor = 0
+        self._recorder: Any = None
+        self._handle: Optional[_FakeRecordingHandle] = None
+        # Handles retained after their recorder stops, in window order.
+        self.handles: list[_FakeRecordingHandle] = []
+        # Windows whose entire interval ran while training was alive.
+        self._completed_windows: list[ProfileWindow] = []
+        self._cancelled = False
+        self._started = False
+
+    @property
+    def step_num(self) -> int:
+        return self._step_num
+
+    @property
+    def is_recording(self) -> bool:
+        return self._recorder is not None
+
+    @property
+    def active_handle(self) -> Optional[_FakeRecordingHandle]:
+        return self._handle
+
+    @property
+    def recorded_windows(self) -> list[ProfileWindow]:
+        """Windows whose full ``[start_step, end_step)`` interval was recorded."""
+        return list(self._completed_windows)
+
+    def start(self) -> "WindowedProfiler":
+        self._started = True
+        return self
+
+    def __enter__(self) -> "WindowedProfiler":
+        return self.start()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # Ensure no recorder is left running, including on abnormal exits.
+        self.cancel()
+        return False
+
+    def _open_window(self):
+        self._recorder = self._recorder_factory()
+        self._recorder.start()
+        self._handle = _FakeRecordingHandle(self._recorder)
+
+    def _close_window(self, completed: bool):
+        window = self.windows[self._cursor]
+        if self._handle is not None:
+            self._handle.stop()
+            self.handles.append(self._handle)
+        if completed:
+            self._completed_windows.append(window)
+        self._handle = None
+        self._recorder = None
+        self._cursor += 1
+
+    def step(self):
+        """
+        Announce that optimizer step :attr:`step_num` is about to run and toggle the
+        recorder according to the merged windows. Must be called at the *top* of each
+        optimizer step, before the work of that step executes.
+        """
+        if not self._started or self._cancelled:
+            self._step_num += 1
+            return
+
+        current = self._step_num
+
+        # Close the active window when the current step is past its end.
+        if self._recorder is not None:
+            active_window = self.windows[self._cursor]
+            if current >= active_window.end_step:
+                self._close_window(completed=True)
+
+        # Advance past windows that were entirely skipped (possible if `step()` was not
+        # called for some steps); such windows produce no recorder or handle.
+        while self._cursor < len(self.windows):
+            window = self.windows[self._cursor]
+            if current >= window.end_step:
+                self._cursor += 1
+                continue
+            break
+
+        # Open the next window if the current step entered it.
+        if self._recorder is None and self._cursor < len(self.windows):
+            window = self.windows[self._cursor]
+            if current >= window.start_step:
+                self._open_window()
+
+        self._step_num += 1
+
+    def cancel(self):
+        """
+        Stop an in-flight recorder immediately when training is cancelled.
+
+        The partially recorded window is not reported in :attr:`recorded_windows`; its
+        closed handle is still retained in :attr:`handles`. Calling ``step()`` after
+        ``cancel()`` is a no-op with respect to recording, and ``cancel()`` is safe to
+        call repeatedly.
+        """
+        self._cancelled = True
+        if self._recorder is not None:
+            active_window = self.windows[self._cursor]
+            # If every step of the window was already announced, the window effectively
+            # completed even without a final `step()` to close it.
+            completed = self._step_num >= active_window.end_step
+            self._close_window(completed=completed)
+
+    def stop(self):
+        """Clean shutdown: closes any active window as if it completed normally."""
+        if self._recorder is not None:
+            self._close_window(completed=True)
+        self._cancelled = True
 
 
 def setup_torch_profiler(
