@@ -9,6 +9,7 @@ import json
 import os
 import time
 from concurrent.futures import Future
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Protocol, Union
 
@@ -24,6 +25,8 @@ from torch.distributed.checkpoint import (
     load,
     save,
 )
+from torch.distributed.checkpoint.default_planner import flatten_state_dict
+from torch.distributed.checkpoint.metadata import TensorStorageMetadata
 from torch.distributed.checkpoint.state_dict_loader import _load_state_dict_from_keys
 
 from torchtune import training
@@ -49,6 +52,121 @@ from torchtune.training.checkpointing._utils import (
 from torchtune.utils import get_logger, get_world_size_and_rank, log_rank_zero
 
 logger = get_logger("DEBUG")
+
+
+@dataclass
+class CheckpointPrecheckResult:
+    """
+    Result of a structural pre-check of a distributed (recipe) checkpoint.
+
+    The pre-check compares the tensors expected by the caller (the model and
+    optimizer state dicts) against the tensors recorded in the checkpoint
+    metadata, without loading any tensor data.
+
+    Attributes:
+        missing_keys: Tensors expected by the caller but absent from the checkpoint.
+        shape_mismatches: Tensors present in both but with mismatched shapes,
+            mapping key -> (expected shape, checkpoint shape).
+        unexpected_keys: Tensors present in the checkpoint but not expected by
+            the caller. These are informational only and do not cause failure.
+    """
+
+    missing_keys: list[str] = field(default_factory=list)
+    shape_mismatches: dict[str, tuple[torch.Size, torch.Size]] = field(
+        default_factory=dict
+    )
+    unexpected_keys: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        """Whether the checkpoint passed the pre-check."""
+        return not self.missing_keys and not self.shape_mismatches
+
+    def error_message(self) -> str:
+        """A human-readable report of the pre-check failure."""
+        lines = ["Checkpoint pre-check failed:"]
+        if self.missing_keys:
+            lines.append(f"  Missing tensors ({len(self.missing_keys)}):")
+            for key in self.missing_keys:
+                lines.append(f"    - {key}")
+        if self.shape_mismatches:
+            lines.append(f"  Shape mismatches ({len(self.shape_mismatches)}):")
+            for key, (expected, found) in self.shape_mismatches.items():
+                lines.append(
+                    f"    - {key}: expected {list(expected)}, found {list(found)}"
+                )
+        lines.append(
+            "The checkpoint was NOT loaded; model and optimizer state are unchanged."
+        )
+        return "\n".join(lines)
+
+    def raise_for_failure(self) -> None:
+        """Raise a ``ValueError`` if the pre-check failed.
+
+        This is called before any checkpoint data is loaded, so a failed
+        pre-check never mutates the in-memory model or optimizer state.
+        """
+        if not self.ok:
+            raise ValueError(self.error_message())
+
+
+def preflight_checkpoint(
+    state_dict: dict[str, Any],
+    checkpoint_path: Union[str, Path],
+) -> CheckpointPrecheckResult:
+    """
+    Structural pre-check of a distributed checkpoint before loading.
+
+    Compares the tensors expected by ``state_dict`` (which mirrors the model and
+    optimizer state dicts that ``dcp.load`` would write into) against the tensors
+    recorded in the checkpoint metadata, without loading any tensor data. This
+    lets callers refuse to load a corrupted checkpoint (missing tensors or shape
+    mismatches) *before* it partially overwrites the in-memory model and optimizer
+    state.
+
+    Non-tensor values (e.g. optimizer hyperparameters, recipe scalars) are stored
+    as raw bytes by DCP and are excluded from the comparison.
+
+    Args:
+        state_dict: The nested state dict that would be passed to ``dcp.load``.
+        checkpoint_path: Path to the distributed checkpoint directory.
+
+    Returns:
+        CheckpointPrecheckResult describing missing tensors, shape mismatches and
+        unexpected tensors.
+    """
+    flattened, _ = flatten_state_dict(state_dict)
+
+    try:
+        fs_reader = FileSystemReader(checkpoint_path)
+        metadata = fs_reader.read_metadata()
+    except Exception as e:
+        raise ValueError(
+            f"Checkpoint pre-check failed: could not read checkpoint metadata at "
+            f"{checkpoint_path!s}. The checkpoint may be corrupted or incomplete."
+        ) from e
+
+    result = CheckpointPrecheckResult()
+
+    for fqn, value in flattened.items():
+        if not isinstance(value, torch.Tensor):
+            # Non-tensor values (optimizer hyperparameters, recipe scalars, ...)
+            # are stored as raw bytes by DCP, not tensors.
+            continue
+
+        storage_meta = metadata.state_dict_metadata.get(fqn)
+        if storage_meta is None or not isinstance(storage_meta, TensorStorageMetadata):
+            result.missing_keys.append(fqn)
+            continue
+
+        if storage_meta.size != value.shape:
+            result.shape_mismatches[fqn] = (value.shape, storage_meta.size)
+
+    for fqn, storage_meta in metadata.state_dict_metadata.items():
+        if fqn not in flattened and isinstance(storage_meta, TensorStorageMetadata):
+            result.unexpected_keys.append(fqn)
+
+    return result
 
 
 class _CheckpointerInterface(Protocol):
@@ -1336,10 +1454,24 @@ class DistributedCheckpointer(_CheckpointerInterface):
         self,
         state_dict: dict[str, Any],
         adapter_only: bool = False,
+        precheck: bool = True,
     ) -> dict[str, Any]:
         """
         Load a Distributed checkpoint saved at the <checkpoint_path>
         If no path is provided, latest intermediate checkpoint is loaded.
+
+        Before loading, a structural pre-check is run against the checkpoint
+        metadata. If the checkpoint is missing tensors or contains tensors with
+        mismatched shapes, a ``ValueError`` is raised *before* any data is loaded,
+        so the in-memory model and optimizer state are left unchanged.
+
+        Args:
+            state_dict: The state dict to load the checkpoint into. This mirrors
+                the model and (optionally) optimizer state dicts.
+            adapter_only: If True, only load the adapter weights.
+            precheck: If True (default), run the structural pre-check before
+                loading. Set to False to bypass the pre-check and restore the
+                previous behavior.
         """
         checkpoint_path = get_most_recent_checkpoint(self.output_dir)
         if checkpoint_path is None:
@@ -1352,6 +1484,18 @@ class DistributedCheckpointer(_CheckpointerInterface):
             checkpoint_path = os.path.join(checkpoint_path, self._adapter_dir)
 
         log_rank_zero(logger, msg=f"Loading checkpoint from {checkpoint_path}")
+
+        if precheck:
+            precheck_result = preflight_checkpoint(state_dict, checkpoint_path)
+            if precheck_result.unexpected_keys:
+                logger.warning(
+                    "Checkpoint pre-check found tensors in the checkpoint that are "
+                    "not expected by the model/optimizer and will be ignored: "
+                    f"{precheck_result.unexpected_keys}"
+                )
+            # Raises before any checkpoint data is loaded, so model/optimizer
+            # state is not mutated on failure.
+            precheck_result.raise_for_failure()
 
         load(
             state_dict=state_dict,
