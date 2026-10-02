@@ -51,6 +51,103 @@ from torchtune.utils import get_logger, get_world_size_and_rank, log_rank_zero
 logger = get_logger("DEBUG")
 
 
+class CheckpointPreflightError(RuntimeError):
+    """
+    Raised when a training checkpoint fails structural preflight validation.
+
+    The error message lists the tensors which are missing from the checkpoint
+    and the tensors whose shapes do not match the reference (e.g. the current
+    model or optimizer). Preflight is read-only: when this error is raised,
+    neither the model nor the optimizer has been modified.
+    """
+
+
+def _flatten_state_dict(
+    state_dict: dict[str, Any], parent_key: str = ""
+) -> dict[str, Any]:
+    """
+    Flatten a (possibly nested) state dict into a single-level dict with
+    dot-separated keys. Non-dict leaf values (tensors, primitives, lists)
+    are kept as-is. Used by :func:`preflight_state_dict` so that nested
+    structures such as ``optimizer.state_dict()["state"]`` can be compared
+    key-by-key.
+    """
+    flat: dict[str, Any] = {}
+    for key, value in state_dict.items():
+        flat_key = f"{parent_key}.{key}" if parent_key else str(key)
+        if isinstance(value, dict):
+            flat.update(_flatten_state_dict(value, flat_key))
+        else:
+            flat[flat_key] = value
+    return flat
+
+
+def preflight_state_dict(
+    checkpoint_state_dict: dict[str, Any],
+    reference_state_dict: dict[str, Any],
+    state_name: str = "model",
+) -> dict[str, Any]:
+    """
+    Structurally compare a checkpoint state dict against a reference state dict
+    (e.g. ``model.state_dict()`` or ``optimizer.state_dict()``) without mutating
+    either. This is a read-only "preflight" check intended to run *before* any
+    ``load_state_dict`` call, so a malformed checkpoint never partially modifies
+    the model or optimizer.
+
+    Args:
+        checkpoint_state_dict (dict[str, Any]): state dict loaded from the checkpoint file.
+        reference_state_dict (dict[str, Any]): state dict describing the expected structure,
+            e.g. from the live model or optimizer.
+        state_name (str): human-readable name used in the report, e.g. "model".
+
+    Returns:
+        dict[str, Any]: a report with keys:
+            - ``state_name`` (str): name of the checked state dict.
+            - ``missing`` (list[str]): flattened keys expected by the reference but
+              absent from the checkpoint.
+            - ``shape_mismatches`` (list[str]): entries of the form
+              ``"<key>: checkpoint shape (...) != expected (...)"`` for tensors
+              present in both but with different shapes.
+    """
+    flat_checkpoint = _flatten_state_dict(checkpoint_state_dict)
+    flat_reference = _flatten_state_dict(reference_state_dict)
+
+    missing = sorted(key for key in flat_reference if key not in flat_checkpoint)
+
+    shape_mismatches = []
+    for key in sorted(flat_reference):
+        if key not in flat_checkpoint:
+            continue
+        ref_value = flat_reference[key]
+        ckpt_value = flat_checkpoint[key]
+        if isinstance(ref_value, torch.Tensor) and isinstance(ckpt_value, torch.Tensor):
+            if tuple(ckpt_value.shape) != tuple(ref_value.shape):
+                shape_mismatches.append(
+                    f"{key}: checkpoint shape {tuple(ckpt_value.shape)} "
+                    f"!= expected {tuple(ref_value.shape)}"
+                )
+
+    return {
+        "state_name": state_name,
+        "missing": missing,
+        "shape_mismatches": shape_mismatches,
+    }
+
+
+def _format_preflight_report(report: dict[str, Any]) -> str:
+    """Render a preflight report (see :func:`preflight_state_dict`) as a string."""
+    lines = [f"[{report['state_name']}]"]
+    if report["missing"]:
+        lines.append("  missing tensors:")
+        lines.extend(f"    - {key}" for key in report["missing"])
+    if report["shape_mismatches"]:
+        lines.append("  shape mismatches:")
+        lines.extend(f"    - {entry}" for entry in report["shape_mismatches"])
+    if not report["missing"] and not report["shape_mismatches"]:
+        lines.append("  OK: no missing tensors, no shape mismatches")
+    return "\n".join(lines)
+
+
 class _CheckpointerInterface(Protocol):
     """
     Interface implemented by Checkpointers in torchtune.
@@ -256,6 +353,102 @@ class FullModelTorchTuneCheckpointer(_CheckpointerInterface):
             recipe_state = safe_torch_load(self._recipe_checkpoint, mmap=False)
             state_dict.update(recipe_state)
         return state_dict
+
+    def preflight_checkpoint(
+        self,
+        model_state_dict: Optional[dict[str, Any]] = None,
+        optimizer_state_dict: Optional[dict[str, Any]] = None,
+        weights_only: bool = True,
+    ) -> dict[str, dict[str, Any]]:
+        """
+        Structurally preflight the checkpoint file(s) on disk against the provided
+        reference state dicts *before* anything is loaded into the model or
+        optimizer. The check is read-only: it lists tensors which are missing from
+        the checkpoint and tensors whose shapes do not match the reference, and on
+        failure raises :class:`CheckpointPreflightError` without modifying the
+        model or optimizer in any way. Valid (older) checkpoints pass the preflight
+        and can then be loaded as usual with :meth:`load_checkpoint`.
+
+        Args:
+            model_state_dict (Optional[dict[str, Any]]): reference model state dict,
+                e.g. ``model.state_dict()``. If provided, the model checkpoint file
+                is validated against it.
+            optimizer_state_dict (Optional[dict[str, Any]]): reference optimizer
+                state dict, e.g. ``optimizer.state_dict()``. If provided, the
+                optimizer state inside the recipe checkpoint is validated against
+                it. Requires ``should_load_recipe_state=True``.
+            weights_only (bool): flag passed down to torch.load. We expose this,
+                because quantized models cannot be loaded with weights_only=True
+
+        Returns:
+            dict[str, dict[str, Any]]: preflight reports keyed by state name
+            ("model" / "optimizer"), see :func:`preflight_state_dict`.
+
+        Raises:
+            ValueError: If no reference state dict is provided, or if an optimizer
+                preflight is requested but no recipe checkpoint is available.
+            CheckpointPreflightError: If the checkpoint is missing tensors or
+                contains tensors with unexpected shapes.
+        """
+        if model_state_dict is None and optimizer_state_dict is None:
+            raise ValueError(
+                "preflight_checkpoint requires at least one of "
+                "model_state_dict or optimizer_state_dict."
+            )
+
+        reports: dict[str, dict[str, Any]] = {}
+
+        if model_state_dict is not None:
+            checkpoint_model_state = safe_torch_load(
+                self._checkpoint_path, weights_only=weights_only
+            )
+            reports[training.MODEL_KEY] = preflight_state_dict(
+                checkpoint_model_state,
+                model_state_dict,
+                state_name=training.MODEL_KEY,
+            )
+
+        if optimizer_state_dict is not None:
+            if not self._should_load_recipe_state or self._recipe_checkpoint is None:
+                raise ValueError(
+                    "Optimizer preflight requires a recipe checkpoint. Please set "
+                    "should_load_recipe_state=True when building the checkpointer."
+                )
+            recipe_state = safe_torch_load(self._recipe_checkpoint, mmap=False)
+            if training.OPT_KEY not in recipe_state:
+                raise ValueError(
+                    f"Recipe checkpoint at {self._recipe_checkpoint} does not "
+                    f"contain an optimizer state (key '{training.OPT_KEY}')."
+                )
+            reports[training.OPT_KEY] = preflight_state_dict(
+                recipe_state[training.OPT_KEY],
+                optimizer_state_dict,
+                state_name=training.OPT_KEY,
+            )
+
+        failures = [
+            report
+            for report in reports.values()
+            if report["missing"] or report["shape_mismatches"]
+        ]
+        if failures:
+            message = (
+                "Checkpoint preflight failed. The model and optimizer have NOT "
+                "been modified. Details:\n"
+                + "\n".join(_format_preflight_report(report) for report in failures)
+            )
+            logger.error(message)
+            raise CheckpointPreflightError(message)
+
+        log_rank_zero(
+            logger,
+            "Checkpoint preflight passed:\n"
+            + "\n".join(
+                _format_preflight_report(report) for report in reports.values()
+            ),
+        )
+        return reports
+
 
     def save_checkpoint(
         self,

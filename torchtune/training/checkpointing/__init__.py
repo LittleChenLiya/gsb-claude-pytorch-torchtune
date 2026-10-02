@@ -6,10 +6,12 @@
 from typing import Union
 
 from torchtune.training.checkpointing._checkpointer import (
+    CheckpointPreflightError,
     DistributedCheckpointer,
     FullModelHFCheckpointer,
     FullModelMetaCheckpointer,
     FullModelTorchTuneCheckpointer,
+    preflight_state_dict,
 )
 from torchtune.training.checkpointing._utils import (
     ADAPTER_CONFIG,
@@ -42,6 +44,8 @@ __all__ = [
     "FullModelMetaCheckpointer",
     "FullModelTorchTuneCheckpointer",
     "DistributedCheckpointer",
+    "CheckpointPreflightError",
+    "preflight_state_dict",
     "ModelType",
     "Checkpointer",
     "update_state_dict_for_classifier",
