@@ -291,16 +291,30 @@ class TestPaddedCollatePacked:
                 "labels": torch.tensor([7, 8, 9, 10, 11, 12]),
                 "input_pos": torch.tensor([0, 1, 2, 0, 1, 0]),
                 "seq_lens": torch.tensor([3, 2, 1]),
+                "sample_boundaries": torch.tensor(
+                    [[0, 0, 3], [1, 3, 5], [2, 5, 6]]
+                ),
             },
             {
                 "tokens": torch.tensor([13, 14, 15, 16, 17, 18]),
                 "labels": torch.tensor([19, 20, 21, 22, 23, 24]),
                 "input_pos": torch.tensor([0, 1, 0, 1, 0, 1]),
                 "seq_lens": torch.tensor([2, 2, 2]),
+                "sample_boundaries": torch.tensor(
+                    [[3, 0, 2], [3, 2, 4], [4, 4, 6]]
+                ),
             },
         ]
         collated = padded_collate_packed(
             batch=token_pairs,
+        )
+        torch.testing.assert_close(
+            collated["sample_boundaries"][0],
+            token_pairs[0]["sample_boundaries"],
+        )
+        torch.testing.assert_close(
+            collated["sample_boundaries"][1],
+            token_pairs[1]["sample_boundaries"],
         )
         torch.testing.assert_close(
             collated["tokens"],

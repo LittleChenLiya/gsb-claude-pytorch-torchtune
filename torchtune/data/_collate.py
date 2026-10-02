@@ -572,9 +572,14 @@ def padded_collate_packed(
             - labels: label token ids
             - input_pos: relative position ids for each sequence in pack
             - seq_lens: lengths of each sample within the pack
+            - sample_boundaries: optional ``[num_samples, 3]`` tensors, each row
+              ``[sample_idx, start, end]``, mapping original samples to their
+              half-open token spans in the pack
 
     Returns:
-        dict[str, torch.Tensor]: Collated input, label, input_pos, mask tensors.
+        dict[str, torch.Tensor]: Collated input, label, input_pos, mask tensors, plus a
+        ``sample_boundaries`` entry (list of per-pack boundary tensors) when the packs
+        provide it.
 
     Example:
         >>> token_pairs = [
@@ -612,12 +617,18 @@ def padded_collate_packed(
         seq_lens=seq_lens,
     )
 
-    return {
+    collated = {
         "tokens": tokens,
         "labels": labels,
         "input_pos": input_pos,
         "mask": block_mask,
     }
+    # Pass through the per-pack sample boundary graph if present. Packs in a
+    # batch may contain different numbers of original samples, so the boundary
+    # tensors are kept as a list rather than stacked.
+    if all("sample_boundaries" in x for x in batch):
+        collated["sample_boundaries"] = [x["sample_boundaries"] for x in batch]
+    return collated
 
 
 def padded_collate_dpo(

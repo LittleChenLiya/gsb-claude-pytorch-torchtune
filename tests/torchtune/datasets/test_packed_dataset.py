@@ -49,6 +49,45 @@ class DummyRealDataset(Dataset):
         return len(self.samples_list)
 
 
+class BoundaryDataset(Dataset):
+    """Three raw samples with lengths 2, 3 and 7. Token/label values are chosen
+    so that original samples can be identified and reconstructed after packing,
+    truncation and padding."""
+
+    def __init__(self):
+        self.tokens = [
+            [10, 11],
+            [20, 21, 22],
+            [30, 31, 32, 33, 34, 35, 36],
+        ]
+
+    def __getitem__(self, index):
+        tokens = list(self.tokens[index])
+        labels = [token + 100 for token in tokens]
+        return {"tokens": tokens, "labels": labels}
+
+    def __len__(self):
+        return len(self.tokens)
+
+
+def _reconstruct_samples(packs, field):
+    """Walk the ``sample_boundaries`` graph of every pack in order and rebuild
+    the original samples by concatenating the indicated ``[start, end)`` slices.
+    Rows sharing a ``sample_idx`` (a sample truncated across packs) are joined."""
+    chunks = {}
+    order = []
+    for pack in packs:
+        for sample_idx, start, end in pack["sample_boundaries"].tolist():
+            if sample_idx not in chunks:
+                chunks[sample_idx] = []
+                order.append(sample_idx)
+            chunks[sample_idx].append(pack[field][start:end])
+    return {
+        sample_idx: torch.cat(chunks[sample_idx]) for sample_idx in order
+    }
+
+
+
 class TestPackedDataset:
     def _get_expected_seq_lens_and_input_pos(
         self, max_seq_len, sample_size, split_across_pack
@@ -266,3 +305,221 @@ class TestPackedDataset:
                 dataset,
                 max_seq_len=4,
             )
+
+    def test_empty_sample_boundaries_shape(self):
+        # A boundary list without any original samples converts to a (0, 3)
+        # tensor. The real packing loop never pads an empty pack, so we only
+        # exercise the conversion here.
+        dataset = DummyDataset(2)
+        packed = PackedDataset(dataset, max_seq_len=4)
+        pack = packed._convert_to_tensors(
+            {
+                "tokens": [1],
+                "labels": [1],
+                "input_pos": [0],
+                "seq_lens": [1],
+                "sample_boundaries": [],
+            }
+        )
+        assert pack["sample_boundaries"].shape == (0, 3)
+        # Pads the single-token pack; padding adds no boundary.
+        padded = packed._pad_pack(pack, padding_idx=0)
+        torch.testing.assert_close(
+            padded["sample_boundaries"], torch.empty((0, 3), dtype=torch.long)
+        )
+
+    def test_sample_boundaries_truncation_2_3_7(self):
+        """Acceptance test for the sample boundary graph using raw samples of
+        lengths 2, 3 and 7 packed into max_seq_len=5 packs with
+        ``split_across_pack=True`` (the length-7 sample is truncated across
+        packs). We check exact boundaries, that padding tokens belong to no
+        original sample, and that the original samples (tokens and labels) can
+        be fully reconstructed from the boundary graph.
+        """
+        padding_idx = 0
+        packed = PackedDataset(
+            BoundaryDataset(),
+            max_seq_len=5,
+            padding_idx=padding_idx,
+            split_across_pack=True,
+        )
+
+        # Pack 0: S0 (len 2) + S1 (len 3), exactly fills the pack
+        # Pack 1: first 5 tokens of S2 (len 7) - truncated here
+        # Pack 2: remaining 2 tokens of S2 + padding
+        expected_tokens = [
+            [10, 11, 20, 21, 22],
+            [30, 31, 32, 33, 34],
+            [35, 36, padding_idx, padding_idx, padding_idx],
+        ]
+        expected_labels = [
+            [110, 111, 120, 121, 122],
+            [130, 131, 132, 133, 134],
+            [135, 136, CROSS_ENTROPY_IGNORE_IDX,
+             CROSS_ENTROPY_IGNORE_IDX, CROSS_ENTROPY_IGNORE_IDX],
+        ]
+        expected_input_pos = [
+            [0, 1, 0, 1, 2],
+            [0, 1, 2, 3, 4],
+            [0, 1, 2, 3, 4],
+        ]
+        expected_seq_lens = [
+            [2, 3],
+            [5],
+            [2, 3],
+        ]
+        expected_boundaries = [
+            [[0, 0, 2], [1, 2, 5]],
+            [[2, 0, 5]],
+            [[2, 0, 2]],
+        ]
+
+        for i, pack in enumerate(packed):
+            torch.testing.assert_close(
+                pack["tokens"], torch.tensor(expected_tokens[i])
+            )
+            torch.testing.assert_close(
+                pack["labels"], torch.tensor(expected_labels[i])
+            )
+            torch.testing.assert_close(
+                pack["input_pos"], torch.tensor(expected_input_pos[i])
+            )
+            torch.testing.assert_close(
+                pack["seq_lens"], torch.tensor(expected_seq_lens[i])
+            )
+            torch.testing.assert_close(
+                pack["sample_boundaries"],
+                torch.tensor(expected_boundaries[i]),
+            )
+
+        # Boundary invariants: half-open spans within the pack, no overlap, and
+        # padding tokens are never covered by a boundary.
+        covered = torch.zeros(5, dtype=torch.bool)
+        for pack in packed:
+            for _, start, end in pack["sample_boundaries"]:
+                assert 0 <= start.item() < end.item() <= 5
+                assert not covered[start:end].any()
+                covered[start:end] = True
+            assert (
+                pack["tokens"][~covered] == padding_idx
+            ).all(), "tokens outside the boundary graph must be padding"
+            covered.zero_()
+
+        # Truncation: sample 2 is split across packs 1 and 2, and its rows are
+        # contiguous and in pack order.
+        s2_rows = torch.cat(
+            [
+                pack["sample_boundaries"]
+                [pack["sample_boundaries"][:, 0] == 2]
+                for pack in packed
+            ]
+        )
+        assert s2_rows[:, 0].tolist() == [2, 2]
+        assert s2_rows[0, 1].item() == 0 and s2_rows[0, 2].item() == 5
+        assert s2_rows[1, 1].item() == 0 and s2_rows[1, 2].item() == 2
+        assert (s2_rows[:, 2] - s2_rows[:, 1]).sum().item() == 7
+
+        # Reconstruction: following the boundary graph recovers every original
+        # sample's tokens and labels exactly (and only) once.
+        reconstructed_tokens = _reconstruct_samples(packed, "tokens")
+        reconstructed_labels = _reconstruct_samples(packed, "labels")
+        original = BoundaryDataset()
+        assert sorted(reconstructed_tokens) == list(range(len(original)))
+        for idx, expected in enumerate(original.tokens):
+            torch.testing.assert_close(
+                reconstructed_tokens[idx], torch.tensor(expected)
+            )
+            torch.testing.assert_close(
+                reconstructed_labels[idx],
+                torch.tensor([token + 100 for token in expected]),
+            )
+
+    def test_sample_boundaries_no_split(self):
+        """Same lengths 2, 3, 7 with split_across_pack=False and max_seq_len=7:
+        the length-7 sample keeps its own pack (no truncation) and packs are
+        padded; padding belongs to no original sample."""
+        padding_idx = 0
+        packed = PackedDataset(
+            BoundaryDataset(),
+            max_seq_len=7,
+            padding_idx=padding_idx,
+            split_across_pack=False,
+        )
+
+        expected_tokens = [
+            [10, 11, 20, 21, 22, padding_idx, padding_idx],
+            [30, 31, 32, 33, 34, 35, 36],
+        ]
+        expected_labels = [
+            [110, 111, 120, 121, 122,
+             CROSS_ENTROPY_IGNORE_IDX, CROSS_ENTROPY_IGNORE_IDX],
+            [130, 131, 132, 133, 134, 135, 136],
+        ]
+        expected_boundaries = [
+            [[0, 0, 2], [1, 2, 5]],
+            [[2, 0, 7]],
+        ]
+
+        for i, pack in enumerate(packed):
+            torch.testing.assert_close(
+                pack["tokens"], torch.tensor(expected_tokens[i])
+            )
+            torch.testing.assert_close(
+                pack["labels"], torch.tensor(expected_labels[i])
+            )
+            torch.testing.assert_close(
+                pack["sample_boundaries"],
+                torch.tensor(expected_boundaries[i]),
+            )
+            # Last two positions of pack 0 are padding and uncovered
+            covered = torch.zeros(7, dtype=torch.bool)
+            for _, start, end in pack["sample_boundaries"]:
+                covered[start:end] = True
+            assert (pack["tokens"][~covered] == padding_idx).all()
+
+        reconstructed_tokens = _reconstruct_samples(packed, "tokens")
+        reconstructed_labels = _reconstruct_samples(packed, "labels")
+        original = BoundaryDataset()
+        for idx, expected in enumerate(original.tokens):
+            torch.testing.assert_close(
+                reconstructed_tokens[idx], torch.tensor(expected)
+            )
+            torch.testing.assert_close(
+                reconstructed_labels[idx],
+                torch.tensor([token + 100 for token in expected]),
+            )
+
+    def test_sample_boundaries_real_data(self):
+        packed = PackedDataset(
+            DummyRealDataset(),
+            max_seq_len=10,
+            split_across_pack=True,
+        )
+        # samples tokenize to lengths 10, 10, 6 (see test_packed_dataset_real_data);
+        # packing split_across_pack=True with max_seq_len=10 splits each long
+        # sample across two packs (7 + 3), and the final pack is padded.
+        expected_boundaries = [
+            [[0, 0, 7], [1, 7, 10]],
+            [[1, 0, 7], [2, 7, 10]],
+            [[2, 0, 6]],
+        ]
+        for i, pack in enumerate(packed):
+            torch.testing.assert_close(
+                pack["sample_boundaries"],
+                torch.tensor(expected_boundaries[i]),
+            )
+
+        # Reconstructed tokens equal the original tokenized samples, truncated
+        # to the non-padding region of the last pack.
+        reconstructed = _reconstruct_samples(packed, "tokens")
+        ds = DummyRealDataset()
+        for i, sample in enumerate(ds):
+            torch.testing.assert_close(
+                reconstructed[i], torch.tensor(sample["tokens"])
+            )
+        # Last 4 positions of the last pack are padding and uncovered.
+        last_pack = packed[-1]
+        covered = torch.zeros(10, dtype=torch.bool)
+        for _, start, end in last_pack["sample_boundaries"]:
+            covered[start:end] = True
+        assert (last_pack["tokens"][~covered] == 0).all()

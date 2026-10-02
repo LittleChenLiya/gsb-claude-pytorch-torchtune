@@ -52,3 +52,11 @@ to prevent different irrelevant samples from cross-attending. This is done via P
 which enables the use of flash attention with non-causal masks. If your hardware does not support Flex Attention
 (for CUDA devices, it must be Turing or above), standard SDPA with memory-efficient attention will be used as a fallback,
 while retaining the document masking and relative position IDs.
+
+Each packed sample additionally contains a ``sample_boundaries`` tensor: the sample
+boundary graph of the pack. It has shape ``[num_samples_in_pack, 3]``, with each row
+``[sample_idx, start, end]`` giving the index of the original unpacked sample and its
+half-open ``[start, end)`` token span within the pack. With ``split_across_pack=True``,
+a sample truncated across packs contributes one row per pack, so the original samples
+can be reconstructed by concatenating the indicated slices. Padding tokens are not
+covered by any boundary and therefore do not belong to any original sample.

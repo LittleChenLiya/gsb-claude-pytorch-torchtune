@@ -32,6 +32,16 @@ class PackedDataset(Dataset):
     of each token relative to its sample within a pack. These are all padded to max
     sequence length, so a batch-wise collator is not needed.
 
+    Each pack also carries a ``sample_boundaries`` tensor: the sample boundary graph of
+    the pack. It has shape ``[num_samples_in_pack, 3]`` and each row is
+    ``[sample_idx, start, end]``, where ``sample_idx`` is the index of the original
+    (unpacked) sample in the source dataset and ``[start, end)`` is the half-open span
+    of its tokens within the pack. When ``split_across_pack=True``, an original sample
+    that is truncated across multiple packs contributes one row per pack, in pack order,
+    so the original sample can be reconstructed by concatenating the indicated slices.
+    Padding tokens are not covered by any boundary and therefore do not belong to any
+    original sample.
+
     A packed sample is made up of individual smaller sequence length samples jammed together
     within ``max_seq_len``. For example, if max_seq_len is 6 and there are varied
     length samples::
@@ -97,6 +107,8 @@ class PackedDataset(Dataset):
         # Where final samples will be held
         self.packs: list[PACK_TYPE] = []
         self.previous_sample_boundary: int = 0
+        # Index of the current original (unpacked) sample in the source dataset
+        self._sample_idx: int = 0
         self._pack()
 
     def _pack(self) -> None:
@@ -109,6 +121,9 @@ class PackedDataset(Dataset):
             "labels": [],
             "input_pos": [],
             "seq_lens": [],
+            # Each row is [sample_idx, start, end): the half-open span of an
+            # original sample's tokens within the current (unpadded) pack
+            "sample_boundaries": [],
         }
 
         # Only show progress bar on rank 0
@@ -134,10 +149,15 @@ class PackedDataset(Dataset):
                 )
 
             # Update the current pack
+            sample_start = len(current_pack["tokens"])
             current_pack["tokens"] += tokens
             current_pack["labels"] += labels
             current_pack["input_pos"] += [x % self.max_seq_len for x in range(seq_len)]
             current_pack["seq_lens"] += [seq_len]
+            current_pack["sample_boundaries"].append(
+                [self._sample_idx, sample_start, sample_start + seq_len]
+            )
+            self._sample_idx += 1
 
             # If the current pack is over the max_seq_len, add it to self.packs and
             # retain any truncated or bumped samples for next pack
@@ -185,11 +205,28 @@ class PackedDataset(Dataset):
             # it will go into the next pack
             seq_len_padding = []
 
+        # Slice the sample boundary graph at the same pack boundary. In the
+        # finalized pack spans are truncated to ``boundary`` (zero-length spans are
+        # dropped); in the leftover pack spans are shifted down by ``boundary``.
+        pack_boundaries = []
+        next_boundaries = []
+        for sample_idx, start, end in current_pack["sample_boundaries"]:
+            if end <= boundary:
+                pack_boundaries.append([sample_idx, start, end])
+            elif start < boundary:
+                pack_boundaries.append([sample_idx, start, boundary])
+                next_boundaries.append([sample_idx, 0, end - boundary])
+            else:
+                next_boundaries.append(
+                    [sample_idx, start - boundary, end - boundary]
+                )
+
         pack = {
             "tokens": current_pack["tokens"][:boundary],
             "labels": current_pack["labels"][:boundary],
             "input_pos": current_pack["input_pos"][:boundary],
             "seq_lens": current_pack["seq_lens"][:-1] + seq_len_padding,
+            "sample_boundaries": pack_boundaries,
         }
 
         # Process and add the pack
@@ -208,6 +245,7 @@ class PackedDataset(Dataset):
             "labels": current_pack["labels"][boundary:],
             "input_pos": current_pack["input_pos"][boundary:],
             "seq_lens": [next_seq_len],
+            "sample_boundaries": next_boundaries,
         }
 
     def _add_pack(self, pack: PACK_TYPE) -> None:
@@ -218,11 +256,18 @@ class PackedDataset(Dataset):
 
     def _convert_to_tensors(self, pack: PACK_TYPE) -> PACK_TYPE:
         """Converts a pack into tensors. Pack comes in as a dict of lists and is converted to tensors."""
+        sample_boundaries = pack.get("sample_boundaries", [])
         return {
             "tokens": torch.tensor(pack["tokens"], dtype=torch.long),
             "labels": torch.tensor(pack["labels"], dtype=torch.long),
             "input_pos": torch.tensor(pack["input_pos"], dtype=torch.long),
             "seq_lens": torch.tensor(pack["seq_lens"], dtype=torch.long),
+            # Shape [num_samples_in_pack, 3]: each row is [sample_idx, start, end]
+            "sample_boundaries": (
+                torch.tensor(sample_boundaries, dtype=torch.long)
+                if sample_boundaries
+                else torch.empty((0, 3), dtype=torch.long)
+            ),
         }
 
     def _pad_pack(self, pack: PACK_TYPE, padding_idx: int) -> PACK_TYPE:
@@ -265,6 +310,9 @@ class PackedDataset(Dataset):
             "labels": padded_labels,
             "input_pos": padded_input_pos,
             "seq_lens": padded_seq_lens,
+            # Padding tokens are not covered by any boundary and do not extend
+            # any original sample's span, so the boundary graph is unchanged.
+            "sample_boundaries": pack["sample_boundaries"],
         }
 
     def __len__(self) -> int:
