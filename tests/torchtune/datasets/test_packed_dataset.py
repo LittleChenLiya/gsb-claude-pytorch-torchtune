@@ -266,3 +266,123 @@ class TestPackedDataset:
                 dataset,
                 max_seq_len=4,
             )
+
+    def test_sample_boundaries_truncation_and_reconstruction(self):
+        """
+        End-to-end test for the sample_boundaries field using three samples of
+        lengths 2, 3, and 7. Verifies:
+          1. Boundaries: each pack's sample_boundaries correctly lists the [start, end)
+             positions of every original sample within the pack.
+          2. Truncation: the length-7 sample is split across two packs; the first pack
+             holds its first 5 tokens and the second pack holds the remaining 2 tokens.
+          3. Reconstruction: the original samples can be recovered by slicing the packed
+             tokens at the reported boundaries, and padding tokens are not assigned to
+             any sample.
+        """
+
+        class ThreeSampleDataset(Dataset):
+            """Returns three samples with lengths 2, 3, 7. Each sample's tokens are
+            filled with the sample index for easy verification."""
+
+            def __init__(self):
+                self.samples = [
+                    {"tokens": [0] * 2, "labels": [0] * 2},
+                    {"tokens": [1] * 3, "labels": [1] * 3},
+                    {"tokens": [2] * 7, "labels": [2] * 7},
+                ]
+
+            def __getitem__(self, index):
+                return self.samples[index]
+
+            def __len__(self):
+                return len(self.samples)
+
+        max_seq_len = 10
+        dataset = ThreeSampleDataset()
+        packed = PackedDataset(
+            dataset,
+            max_seq_len=max_seq_len,
+            split_across_pack=True,
+        )
+
+        # With max_seq_len=10 and split_across_pack=True:
+        #   Pack 0: sample0 (len 2) + sample1 (len 3) + sample2 first 5 tokens
+        #   Pack 1: sample2 remaining 2 tokens + 8 padding tokens
+        assert len(packed) == 2
+
+        pack0 = packed[0]
+        pack1 = packed[1]
+
+        # --- 1. Boundaries ---
+        # Pack 0: sample0 [0,2), sample1 [2,5), sample2 (truncated) [5,10)
+        expected_boundaries_0 = torch.tensor([[0, 2], [2, 5], [5, 10]])
+        torch.testing.assert_close(pack0["sample_boundaries"], expected_boundaries_0)
+
+        # Pack 1: sample2 (continued) [0,2); padding has no boundary entry
+        expected_boundaries_1 = torch.tensor([[0, 2]])
+        torch.testing.assert_close(pack1["sample_boundaries"], expected_boundaries_1)
+
+        # Boundaries must be sorted and non-overlapping within a pack
+        for pack in [pack0, pack1]:
+            boundaries = pack["sample_boundaries"]
+            for i in range(len(boundaries) - 1):
+                assert boundaries[i][1] == boundaries[i + 1][0], (
+                    "Boundaries must be contiguous and non-overlapping"
+                )
+            # The last boundary end must not exceed max_seq_len
+            assert boundaries[-1][1] <= max_seq_len
+
+        # --- 2. Truncation ---
+        # The length-7 sample is split: 5 tokens in pack 0, 2 tokens in pack 1
+        assert pack0["sample_boundaries"][-1].tolist() == [5, 10]
+        assert pack1["sample_boundaries"][0].tolist() == [0, 2]
+
+        # Verify the actual tokens at the truncation point
+        # Pack 0 tokens: [0, 0, 1, 1, 1, 2, 2, 2, 2, 2]
+        torch.testing.assert_close(
+            pack0["tokens"], torch.tensor([0, 0, 1, 1, 1, 2, 2, 2, 2, 2])
+        )
+        # Pack 1 tokens: [2, 2, pad, pad, pad, pad, pad, pad, pad, pad]
+        torch.testing.assert_close(
+            pack1["tokens"],
+            torch.tensor([2, 2, 0, 0, 0, 0, 0, 0, 0, 0]),  # padding_idx=0
+        )
+
+        # --- 3. Reconstruction ---
+        # Reconstruct each original sample by concatenating slices from the packs
+        reconstructed = [None, None, None]
+
+        # Sample 0: entirely in pack 0 at [0, 2)
+        b0 = pack0["sample_boundaries"][0]
+        reconstructed[0] = pack0["tokens"][b0[0] : b0[1]].tolist()
+
+        # Sample 1: entirely in pack 0 at [2, 5)
+        b1 = pack0["sample_boundaries"][1]
+        reconstructed[1] = pack0["tokens"][b1[0] : b1[1]].tolist()
+
+        # Sample 2: split across pack 0 [5, 10) and pack 1 [0, 2)
+        b2_pack0 = pack0["sample_boundaries"][2]
+        b2_pack1 = pack1["sample_boundaries"][0]
+        reconstructed[2] = (
+            pack0["tokens"][b2_pack0[0] : b2_pack0[1]].tolist()
+            + pack1["tokens"][b2_pack1[0] : b2_pack1[1]].tolist()
+        )
+
+        # Verify reconstruction matches the original samples
+        assert reconstructed[0] == [0, 0]
+        assert reconstructed[1] == [1, 1, 1]
+        assert reconstructed[2] == [2, 2, 2, 2, 2, 2, 2]
+
+        # Verify that padding tokens are NOT covered by any boundary
+        # Pack 1 has 8 padding tokens (positions 2..9); no boundary should cover them
+        covered_positions = set()
+        for start, end in pack1["sample_boundaries"].tolist():
+            for pos in range(start, end):
+                covered_positions.add(pos)
+        # Padding positions are 2..9 (10 - 2 = 8 padding tokens)
+        padding_positions = set(range(2, max_seq_len))
+        assert covered_positions.isdisjoint(padding_positions), (
+            "Padding tokens must not be assigned to any sample"
+        )
+        # All non-padding positions must be covered
+        assert covered_positions == set(range(0, 2))

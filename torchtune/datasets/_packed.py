@@ -66,6 +66,12 @@ class PackedDataset(Dataset):
     For position ids for pad tokens, we simply continue to increment from the previous
     sample normally.
 
+    Each pack also exposes a ``sample_boundaries`` tensor of shape ``(num_samples, 2)``
+    containing the ``[start, end)`` positions of each original sample within the pack.
+    Padding tokens are not assigned to any sample, so they are excluded from the
+    boundaries. This allows callers to reconstruct the original samples from the
+    packed tokens.
+
     Args:
         ds (Dataset): dataset to sample pack. This should return a dictionary with field
             "tokens" and "labels" containing the tokenized and label samples.
@@ -109,6 +115,7 @@ class PackedDataset(Dataset):
             "labels": [],
             "input_pos": [],
             "seq_lens": [],
+            "sample_boundaries": [],
         }
 
         # Only show progress bar on rank 0
@@ -134,10 +141,14 @@ class PackedDataset(Dataset):
                 )
 
             # Update the current pack
+            sample_start = len(current_pack["tokens"])
             current_pack["tokens"] += tokens
             current_pack["labels"] += labels
             current_pack["input_pos"] += [x % self.max_seq_len for x in range(seq_len)]
             current_pack["seq_lens"] += [seq_len]
+            current_pack["sample_boundaries"] += [
+                [sample_start, sample_start + seq_len]
+            ]
 
             # If the current pack is over the max_seq_len, add it to self.packs and
             # retain any truncated or bumped samples for next pack
@@ -185,11 +196,21 @@ class PackedDataset(Dataset):
             # it will go into the next pack
             seq_len_padding = []
 
+        # Clip sample boundaries to the pack being added. Any sample that extends
+        # beyond ``boundary`` is truncated (split_across_pack) or moved entirely to
+        # the next pack (split_across_pack=False).
+        pack_boundaries = []
+        for start, end in current_pack["sample_boundaries"]:
+            if start >= boundary:
+                break
+            pack_boundaries.append([start, min(end, boundary)])
+
         pack = {
             "tokens": current_pack["tokens"][:boundary],
             "labels": current_pack["labels"][:boundary],
             "input_pos": current_pack["input_pos"][:boundary],
             "seq_lens": current_pack["seq_lens"][:-1] + seq_len_padding,
+            "sample_boundaries": pack_boundaries,
         }
 
         # Process and add the pack
@@ -203,11 +224,19 @@ class PackedDataset(Dataset):
             else current_pack["seq_lens"][-1]
         )
 
+        # Adjust sample boundaries for the next pack to start from 0
+        next_boundaries = []
+        for start, end in current_pack["sample_boundaries"]:
+            if end <= boundary:
+                continue
+            next_boundaries.append([max(start, boundary) - boundary, end - boundary])
+
         return {
             "tokens": current_pack["tokens"][boundary:],
             "labels": current_pack["labels"][boundary:],
             "input_pos": current_pack["input_pos"][boundary:],
             "seq_lens": [next_seq_len],
+            "sample_boundaries": next_boundaries,
         }
 
     def _add_pack(self, pack: PACK_TYPE) -> None:
@@ -218,11 +247,15 @@ class PackedDataset(Dataset):
 
     def _convert_to_tensors(self, pack: PACK_TYPE) -> PACK_TYPE:
         """Converts a pack into tensors. Pack comes in as a dict of lists and is converted to tensors."""
+        sample_boundaries = pack.get("sample_boundaries", [])
         return {
             "tokens": torch.tensor(pack["tokens"], dtype=torch.long),
             "labels": torch.tensor(pack["labels"], dtype=torch.long),
             "input_pos": torch.tensor(pack["input_pos"], dtype=torch.long),
             "seq_lens": torch.tensor(pack["seq_lens"], dtype=torch.long),
+            "sample_boundaries": torch.tensor(
+                sample_boundaries, dtype=torch.long
+            ).reshape(-1, 2),
         }
 
     def _pad_pack(self, pack: PACK_TYPE, padding_idx: int) -> PACK_TYPE:
@@ -265,6 +298,7 @@ class PackedDataset(Dataset):
             "labels": padded_labels,
             "input_pos": padded_input_pos,
             "seq_lens": padded_seq_lens,
+            "sample_boundaries": pack.get("sample_boundaries", torch.zeros((0, 2), dtype=torch.long)),
         }
 
     def __len__(self) -> int:
