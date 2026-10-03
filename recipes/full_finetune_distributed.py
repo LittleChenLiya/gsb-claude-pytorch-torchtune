@@ -966,179 +966,181 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         num_tokens = 0
 
         self._profiler.start()
-        # self.epochs_run should be non-zero when we're resuming from a checkpoint
-        for curr_epoch in range(self.epochs_run, self.total_epochs):
-            inner_step_count = self.global_step % self._steps_per_epoch
-            pbar = tqdm(
-                initial=inner_step_count,
-                total=self._steps_per_epoch,
-                desc=f"{self.epochs_run}|{self.global_step}",
-            )
 
-            # Get iterator for the dataloader
-            self._dataloader.sampler.set_epoch(curr_epoch)
-            dataloader_iter = iter(self._dataloader)
-            batch_count = 0
+        try:
+            for curr_epoch in range(self.epochs_run, self.total_epochs):
+                inner_step_count = self.global_step % self._steps_per_epoch
+                pbar = tqdm(
+                    initial=inner_step_count,
+                    total=self._steps_per_epoch,
+                    desc=f"{self.epochs_run}|{self.global_step}",
+                )
 
-            # Continue looping until we reach max steps or exhaust the dataset
-            while inner_step_count < self._steps_per_epoch:
-                # Try to get the next batch, break if we've reached the end of the dataset
-                try:
-                    batch = next(dataloader_iter)
-                except StopIteration:
-                    break
+                # Get iterator for the dataloader
+                self._dataloader.sampler.set_epoch(curr_epoch)
+                dataloader_iter = iter(self._dataloader)
+                batch_count = 0
 
-                # Start tracking CUDA memory for active steps for just the first epoch
-                if (
-                    self._is_rank_zero
-                    and curr_epoch == 0
-                    and self.profiler_profile_memory
-                    and batch_count
-                    == self.profiler_wait_steps + self.profiler_warmup_steps
-                    and self._device.type == "cuda"
-                ):
-                    torch.cuda.memory._record_memory_history()
+                # Continue looping until we reach max steps or exhaust the dataset
+                while inner_step_count < self._steps_per_epoch:
+                    # Try to get the next batch, break if we've reached the end of the dataset
+                    try:
+                        batch = next(dataloader_iter)
+                    except StopIteration:
+                        break
 
-                utils.batch_to_device(batch, self._device)
+                    # Start tracking CUDA memory for active steps for just the first epoch
+                    if (
+                        self._is_rank_zero
+                        and curr_epoch == 0
+                        and self.profiler_profile_memory
+                        and batch_count
+                        == self.profiler_wait_steps + self.profiler_warmup_steps
+                        and self._device.type == "cuda"
+                    ):
+                        torch.cuda.memory._record_memory_history()
 
-                with self.train_context(
-                    self.context_parallel_manager(list(batch.values()))
-                ):
-                    # Calculate the number of unmasked tokens in the current batch
-                    # and increment the total number of tokens seen in the step
-                    current_num_tokens = (
-                        batch["labels"] != self._loss_fn.ignore_index
-                    ).sum()
-                    num_tokens += current_num_tokens
+                    utils.batch_to_device(batch, self._device)
 
-                    # Loss is normalized by default so we multiply by the number of tokens
-                    # This way we can normalize by the total number of tokens if we're accumulating gradients
-                    current_loss = self._loss_step(batch) * current_num_tokens
-                    running_loss += current_loss
-                    # For optimizer in backward, we need to normalize before calling backward
-                    # This case and gradient accumulation are mutually exclusive
-                    if self._optimizer_in_bwd:
-                        torch.distributed.all_reduce(num_tokens)
-                        torch.distributed.all_reduce(running_loss)
-                        current_loss = current_loss * (self.dp_degree / num_tokens)
-                    current_loss.backward()
+                    with self.train_context(
+                        self.context_parallel_manager(list(batch.values()))
+                    ):
+                        # Calculate the number of unmasked tokens in the current batch
+                        # and increment the total number of tokens seen in the step
+                        current_num_tokens = (
+                            batch["labels"] != self._loss_fn.ignore_index
+                        ).sum()
+                        num_tokens += current_num_tokens
 
-                # Optimizer step (if not fused in backward call)
-                if (batch_count + 1) % self._gradient_accumulation_steps == 0:
-                    if not self._optimizer_in_bwd:
-                        # Get total number of tokens across all ranks to normalize gradients
-                        torch.distributed.all_reduce(num_tokens)
-                        # This will ensure that the logged loss matches what we're optimizing
-                        torch.distributed.all_reduce(running_loss)
+                        # Loss is normalized by default so we multiply by the number of tokens
+                        # This way we can normalize by the total number of tokens if we're accumulating gradients
+                        current_loss = self._loss_step(batch) * current_num_tokens
+                        running_loss += current_loss
+                        # For optimizer in backward, we need to normalize before calling backward
+                        # This case and gradient accumulation are mutually exclusive
+                        if self._optimizer_in_bwd:
+                            torch.distributed.all_reduce(num_tokens)
+                            torch.distributed.all_reduce(running_loss)
+                            current_loss = current_loss * (self.dp_degree / num_tokens)
+                        current_loss.backward()
 
-                        # Manually scale the gradients from unnormalized loss by total # of tokens
-                        self._grad_scaler(
-                            list(self._model.parameters()),
-                            self.world_size / num_tokens,
-                            False if self.parallel_dims.tp_enabled else None,
+                    # Optimizer step (if not fused in backward call)
+                    if (batch_count + 1) % self._gradient_accumulation_steps == 0:
+                        if not self._optimizer_in_bwd:
+                            # Get total number of tokens across all ranks to normalize gradients
+                            torch.distributed.all_reduce(num_tokens)
+                            # This will ensure that the logged loss matches what we're optimizing
+                            torch.distributed.all_reduce(running_loss)
+
+                            # Manually scale the gradients from unnormalized loss by total # of tokens
+                            self._grad_scaler(
+                                list(self._model.parameters()),
+                                self.world_size / num_tokens,
+                                False if self.parallel_dims.tp_enabled else None,
+                            )
+
+                            if self._clip_grad_norm is not None:
+                                grad_norm = torch.nn.utils.clip_grad_norm_(
+                                    self._model.parameters(),
+                                    max_norm=float(self._clip_grad_norm),
+                                )
+                                # If sharded, collect the DTensor here
+                                if isinstance(grad_norm, DTensor):
+                                    grad_norm = grad_norm.full_tensor()
+                            self._optimizer.step()
+                            self._optimizer.zero_grad(set_to_none=True)
+
+                        # Step the learning rate scheduler
+                        if self._lr_scheduler is not None:
+                            self._lr_scheduler.step()
+
+                        self.global_step += 1
+                        inner_step_count += 1
+
+                        # If float8 training is enabled, perform a single all-reduce to compute the
+                        # scale for all float8 parameters efficiently instead of doing many small
+                        # all-reduces for each parameter
+                        if (
+                            self._enable_fp8_training
+                            and is_fp8_tensorwise_scaling(self._fp8_recipe_name)
+                            and self.dp_degree > 1
+                        ):
+                            precompute_float8_dynamic_scale_for_fsdp(self._model)
+
+                        loss_to_log = running_loss.detach().item() / num_tokens
+                        pbar.update(1)
+                        pbar.set_description(
+                            f"{curr_epoch + 1}|{self.global_step}|Loss: {loss_to_log}"
                         )
 
-                        if self._clip_grad_norm is not None:
-                            grad_norm = torch.nn.utils.clip_grad_norm_(
-                                self._model.parameters(),
-                                max_norm=float(self._clip_grad_norm),
-                            )
-                            # If sharded, collect the DTensor here
-                            if isinstance(grad_norm, DTensor):
-                                grad_norm = grad_norm.full_tensor()
-                        self._optimizer.step()
-                        self._optimizer.zero_grad(set_to_none=True)
-
-                    # Step the learning rate scheduler
-                    if self._lr_scheduler is not None:
-                        self._lr_scheduler.step()
-
-                    self.global_step += 1
-                    inner_step_count += 1
-
-                    # If float8 training is enabled, perform a single all-reduce to compute the
-                    # scale for all float8 parameters efficiently instead of doing many small
-                    # all-reduces for each parameter
-                    if (
-                        self._enable_fp8_training
-                        and is_fp8_tensorwise_scaling(self._fp8_recipe_name)
-                        and self.dp_degree > 1
-                    ):
-                        precompute_float8_dynamic_scale_for_fsdp(self._model)
-
-                    loss_to_log = running_loss.detach().item() / num_tokens
-                    pbar.update(1)
-                    pbar.set_description(
-                        f"{curr_epoch + 1}|{self.global_step}|Loss: {loss_to_log}"
-                    )
-
-                    # Log per-step metrics
-                    if (
-                        self.global_step % self._log_every_n_steps == 0
-                        and self._is_rank_zero
-                    ):
-                        time_per_step = time.perf_counter() - t0
-                        log_dict = {
-                            "loss": loss_to_log,
-                            "lr": get_lr(
-                                (
-                                    self._optimizer
-                                    if not self._optimizer_in_bwd
-                                    else self._optim_ckpt_wrapper
+                        # Log per-step metrics
+                        if (
+                            self.global_step % self._log_every_n_steps == 0
+                            and self._is_rank_zero
+                        ):
+                            time_per_step = time.perf_counter() - t0
+                            log_dict = {
+                                "loss": loss_to_log,
+                                "lr": get_lr(
+                                    (
+                                        self._optimizer
+                                        if not self._optimizer_in_bwd
+                                        else self._optim_ckpt_wrapper
+                                    ),
                                 ),
-                            ),
-                            "tokens_per_second_per_gpu": (
-                                num_tokens / self.parallel_dims.non_data_parallel_size
+                                "tokens_per_second_per_gpu": (
+                                    num_tokens / self.parallel_dims.non_data_parallel_size
+                                )
+                                / (time_per_step * self.world_size),
+                            }
+                            if self._log_peak_memory_stats:
+                                log_dict.update(
+                                    training.get_memory_stats(device=self._device)
+                                )
+                            if self._clip_grad_norm is not None:
+                                log_dict.update({"grad_norm": grad_norm})
+                            self._metric_logger.log_dict(
+                                log_dict,
+                                step=self.global_step,
                             )
-                            / (time_per_step * self.world_size),
-                        }
-                        if self._log_peak_memory_stats:
-                            log_dict.update(
-                                training.get_memory_stats(device=self._device)
-                            )
-                        if self._clip_grad_norm is not None:
-                            log_dict.update({"grad_norm": grad_norm})
-                        self._metric_logger.log_dict(
-                            log_dict,
-                            step=self.global_step,
-                        )
 
-                    # Save checkpoint if specified by user
-                    if self.global_step % self.save_every_n_steps == 0:
-                        self.save_checkpoint(epoch=curr_epoch, full_tensors=False)
+                        # Save checkpoint if specified by user
+                        if self.global_step % self.save_every_n_steps == 0:
+                            self.save_checkpoint(epoch=curr_epoch, full_tensors=False)
 
-                    # Reset running stats for the next step
-                    running_loss = 0
-                    num_tokens = 0
-                    t0 = time.perf_counter()
+                        # Reset running stats for the next step
+                        running_loss = 0
+                        num_tokens = 0
+                        t0 = time.perf_counter()
 
-                # Stop tracking CUDA memory now that active steps are complete
-                if (
-                    self._is_rank_zero
-                    and curr_epoch == 0
-                    and self.profiler_profile_memory
-                    and batch_count
-                    == self.profiler_wait_steps
-                    + self.profiler_warmup_steps
-                    + self.profiler_active_steps
-                    and self._device.type == "cuda"
-                ):
-                    torch.cuda.memory._record_memory_history(enabled=None)
+                    # Stop tracking CUDA memory now that active steps are complete
+                    if (
+                        self._is_rank_zero
+                        and curr_epoch == 0
+                        and self.profiler_profile_memory
+                        and batch_count
+                        == self.profiler_wait_steps
+                        + self.profiler_warmup_steps
+                        + self.profiler_active_steps
+                        and self._device.type == "cuda"
+                    ):
+                        torch.cuda.memory._record_memory_history(enabled=None)
 
-                self._profiler.step()
-                batch_count += 1
+                    self._profiler.step()
+                    batch_count += 1
 
-                # Run validation after gradient update
-                if (
-                    self._run_val_every_n_steps is not None
-                    and self.global_step % self._run_val_every_n_steps == 0
-                ):
-                    pbar.refresh()
-                    self.validate()
+                    # Run validation after gradient update
+                    if (
+                        self._run_val_every_n_steps is not None
+                        and self.global_step % self._run_val_every_n_steps == 0
+                    ):
+                        pbar.refresh()
+                        self.validate()
 
-            self.epochs_run += 1
+                self.epochs_run += 1
 
-        self._profiler.stop()
+        finally:
+            self._profiler.stop()
 
         # Save final non-distributed ckpt
         self.save_checkpoint(epoch=self.total_epochs - 1, full_tensors=True)

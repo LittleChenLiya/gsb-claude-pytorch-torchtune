@@ -574,120 +574,122 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
         running_loss, num_tokens = 0.0, 0
         self._profiler.start()
 
-        for curr_epoch in range(self.epochs_run, self.total_epochs):
-            inner_step_count = self.global_step % self._steps_per_epoch
-            pbar = tqdm(
-                initial=inner_step_count,
-                total=self._steps_per_epoch,
-                desc=f"{self.epochs_run}|{self.global_step}",
-            )
+        try:
+            for curr_epoch in range(self.epochs_run, self.total_epochs):
+                inner_step_count = self.global_step % self._steps_per_epoch
+                pbar = tqdm(
+                    initial=inner_step_count,
+                    total=self._steps_per_epoch,
+                    desc=f"{self.epochs_run}|{self.global_step}",
+                )
 
-            # Get iterator for the dataloader
-            self._dataloader.sampler.set_epoch(curr_epoch)
-            dataloader_iter = iter(self._dataloader)
-            batch_count = 0
+                # Get iterator for the dataloader
+                self._dataloader.sampler.set_epoch(curr_epoch)
+                dataloader_iter = iter(self._dataloader)
+                batch_count = 0
 
-            # Continue looping until we reach max steps or exhaust the dataset
-            while inner_step_count < self._steps_per_epoch:
-                # Try to get the next batch, break if we've reached the end of the dataset
-                try:
-                    batch = next(dataloader_iter)
-                except StopIteration:
-                    break
+                # Continue looping until we reach max steps or exhaust the dataset
+                while inner_step_count < self._steps_per_epoch:
+                    # Try to get the next batch, break if we've reached the end of the dataset
+                    try:
+                        batch = next(dataloader_iter)
+                    except StopIteration:
+                        break
 
-                # Start tracking CUDA memory for active steps for just the first epoch
-                if (
-                    curr_epoch == 0
-                    and self.profiler_profile_memory
-                    and batch_count
-                    == self.profiler_wait_steps + self.profiler_warmup_steps
-                    and self._device.type == "cuda"
-                ):
-                    torch.cuda.memory._record_memory_history()
+                    # Start tracking CUDA memory for active steps for just the first epoch
+                    if (
+                        curr_epoch == 0
+                        and self.profiler_profile_memory
+                        and batch_count
+                        == self.profiler_wait_steps + self.profiler_warmup_steps
+                        and self._device.type == "cuda"
+                    ):
+                        torch.cuda.memory._record_memory_history()
 
-                utils.batch_to_device(batch, self._device)
-                current_num_tokens = (
-                    batch["labels"] != self._loss_fn.ignore_index
-                ).sum()
-                num_tokens += current_num_tokens
+                    utils.batch_to_device(batch, self._device)
+                    current_num_tokens = (
+                        batch["labels"] != self._loss_fn.ignore_index
+                    ).sum()
+                    num_tokens += current_num_tokens
 
-                # Mean loss for in-bwd optimizers, else multiply by token count
-                loss_factor = current_num_tokens if not self.optimizer_in_bwd else 1.0
-                current_loss = self._loss_step(batch) * loss_factor
+                    # Mean loss for in-bwd optimizers, else multiply by token count
+                    loss_factor = current_num_tokens if not self.optimizer_in_bwd else 1.0
+                    current_loss = self._loss_step(batch) * loss_factor
 
-                running_loss += current_loss.detach()
-                current_loss.backward()
+                    running_loss += current_loss.detach()
+                    current_loss.backward()
 
-                # Take a normal optimizer step
-                if (batch_count + 1) % self._gradient_accumulation_steps == 0:
-                    grad_norm = None
-                    if not self.optimizer_in_bwd:
-                        training.scale_grads_(
-                            self._model.parameters(), 1.0 / num_tokens
+                    # Take a normal optimizer step
+                    if (batch_count + 1) % self._gradient_accumulation_steps == 0:
+                        grad_norm = None
+                        if not self.optimizer_in_bwd:
+                            training.scale_grads_(
+                                self._model.parameters(), 1.0 / num_tokens
+                            )
+                            if self._clip_grad_norm:
+                                grad_norm = torch.nn.utils.clip_grad_norm_(
+                                    self._model.parameters(), float(self._clip_grad_norm)
+                                )
+
+                        # This will be a no-op for optim in bwd, but prevents a warning w/ LR Scheduler
+                        self.optimizer.step()
+                        self.optimizer.zero_grad(set_to_none=True)
+
+                        if self.lr_scheduler is not None:
+                            self.lr_scheduler.step()
+
+                        self.global_step += 1
+                        inner_step_count += 1
+                        loss_value = (
+                            running_loss
+                            / (num_tokens if not self.optimizer_in_bwd else 1.0)
+                        ).item()
+                        pbar.update(1)
+                        pbar.set_description(
+                            f"{curr_epoch + 1}|{self.global_step}|Loss: {loss_value:.4f}"
                         )
-                        if self._clip_grad_norm:
-                            grad_norm = torch.nn.utils.clip_grad_norm_(
-                                self._model.parameters(), float(self._clip_grad_norm)
+
+                        if self.global_step % self._log_every_n_steps == 0:
+                            time_per_step = time.perf_counter() - t0
+                            log_dict = {
+                                "loss": loss_value,
+                                "lr": get_lr(self.optimizer),
+                                "tokens_per_second_per_gpu": (num_tokens / time_per_step),
+                            }
+                            if self._device.type != "cpu" and self._log_peak_memory_stats:
+                                log_dict.update(training.get_memory_stats(self._device))
+                            if grad_norm is not None:
+                                log_dict["grad_norm"] = grad_norm
+                            self._metric_logger.log_dict(log_dict, step=self.global_step)
+
+                        # Save checkpoint if specified by user
+                        if self.global_step % self.save_every_n_steps == 0:
+                            self.save_checkpoint(
+                                epoch=curr_epoch, step=self.global_step, full_tensors=False
                             )
 
-                    # This will be a no-op for optim in bwd, but prevents a warning w/ LR Scheduler
-                    self.optimizer.step()
-                    self.optimizer.zero_grad(set_to_none=True)
+                        running_loss, num_tokens = 0.0, 0
+                        t0 = time.perf_counter()
 
-                    if self.lr_scheduler is not None:
-                        self.lr_scheduler.step()
+                    # Optionally stop memory profiling
+                    if (
+                        curr_epoch == 0
+                        and self.profiler_profile_memory
+                        and batch_count
+                        == self.profiler_wait_steps
+                        + self.profiler_warmup_steps
+                        + self.profiler_active_steps
+                        and self._device.type == "cuda"
+                    ):
+                        torch.cuda.memory._record_memory_history(enabled=None)
 
-                    self.global_step += 1
-                    inner_step_count += 1
-                    loss_value = (
-                        running_loss
-                        / (num_tokens if not self.optimizer_in_bwd else 1.0)
-                    ).item()
-                    pbar.update(1)
-                    pbar.set_description(
-                        f"{curr_epoch + 1}|{self.global_step}|Loss: {loss_value:.4f}"
-                    )
+                    self._profiler.step()
+                    batch_count += 1
 
-                    if self.global_step % self._log_every_n_steps == 0:
-                        time_per_step = time.perf_counter() - t0
-                        log_dict = {
-                            "loss": loss_value,
-                            "lr": get_lr(self.optimizer),
-                            "tokens_per_second_per_gpu": (num_tokens / time_per_step),
-                        }
-                        if self._device.type != "cpu" and self._log_peak_memory_stats:
-                            log_dict.update(training.get_memory_stats(self._device))
-                        if grad_norm is not None:
-                            log_dict["grad_norm"] = grad_norm
-                        self._metric_logger.log_dict(log_dict, step=self.global_step)
+                self.epochs_run += 1
 
-                    # Save checkpoint if specified by user
-                    if self.global_step % self.save_every_n_steps == 0:
-                        self.save_checkpoint(
-                            epoch=curr_epoch, step=self.global_step, full_tensors=False
-                        )
-
-                    running_loss, num_tokens = 0.0, 0
-                    t0 = time.perf_counter()
-
-                # Optionally stop memory profiling
-                if (
-                    curr_epoch == 0
-                    and self.profiler_profile_memory
-                    and batch_count
-                    == self.profiler_wait_steps
-                    + self.profiler_warmup_steps
-                    + self.profiler_active_steps
-                    and self._device.type == "cuda"
-                ):
-                    torch.cuda.memory._record_memory_history(enabled=None)
-
-                self._profiler.step()
-                batch_count += 1
-
-            self.epochs_run += 1
-
-        self._profiler.stop()
+        finally:
+            self._profiler.stop()
 
         # Save final non-distributed ckpt
         self.save_checkpoint(

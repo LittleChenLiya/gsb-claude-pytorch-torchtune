@@ -37,7 +37,9 @@ from torchtune.training._profiler import (
     DEFAULT_TRACE_OPTS,
     DummyProfiler,
     PROFILER_KEY,
+    ProfilingWindow,
     setup_torch_profiler,
+    WindowedProfiler,
 )
 from torchtune.training.activations import apply_selective_activation_checkpointing
 from torchtune.training.checkpointing import (
@@ -138,6 +140,8 @@ __all__ = [
     "DEFAULT_TRACE_OPTS",
     "DummyProfiler",
     "PROFILER_KEY",
+    "ProfilingWindow",
+    "WindowedProfiler",
     "setup_torch_profiler",
     "compile_loss",
     "compile_model",
