@@ -108,7 +108,10 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
             Optimizer State and recipe state (seed, total_epochs, number of epochs run etc) are
             only saved at the end of a given epoch and used in case of resuming training. Resuming
             training is controlled by the ``resume_from_checkpoint`` flag. Mid-epoch checkpointing is
-            currently not supported.
+            currently not supported. When resuming, the recipe verifies that the epoch count, the
+            optimizer step count and the LR scheduler step count restored from the checkpoint are
+            consistent with each other and raises an error instead of continuing training if they
+            are not.
 
             For more details on the checkpointer, please take a look at
             our checkpointer deepdive (https://pytorch.org/torchtune/main/tutorials/checkpointer.html).
@@ -168,6 +171,10 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
         self.total_epochs = cfg.epochs
         self.max_steps_per_epoch = cfg.max_steps_per_epoch
         self.global_step = 0
+        # Number of optimizer/scheduler steps restored from the checkpoint, if the
+        # checkpoint records it. Stays None for fresh runs and for checkpoints
+        # saved before this field was tracked.
+        self._steps_run_from_ckpt = None
         self._resume_from_checkpoint = cfg.resume_from_checkpoint
         self._save_adapter_weights_only = cfg.get("save_adapter_weights_only", False)
         self._gradient_accumulation_steps = cfg.gradient_accumulation_steps
@@ -209,6 +216,18 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
         try:
             self.epochs_run = ckpt_dict[training.EPOCHS_KEY]
 
+            # Restore the number of optimizer/scheduler steps run so far. Checkpoints
+            # saved before this field was tracked either lack the key or hold a
+            # placeholder value (None, or 0 from the distributed checkpoint template).
+            # A genuine checkpoint always records steps_run >= 1 because checkpoints
+            # are only saved after at least one optimizer step, so a falsy value is
+            # treated as "not recorded" and the step count is derived from
+            # ``epochs_run`` later on (see ``setup``).
+            steps_run = ckpt_dict.get(training.STEPS_KEY, None)
+            if steps_run:
+                self._steps_run_from_ckpt = steps_run
+                self.global_step = steps_run
+
             # on mismatch, warn the user and prevent the override
             if self.seed != ckpt_dict[training.SEED_KEY]:
                 warn(
@@ -241,6 +260,101 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
                 "Checkpoint does not contain the required keys needed for updating recipe state. "
                 "Are you sure you passed in the right recipe checkpoint?"
             ) from e
+
+    def _optimizer_step_count(self) -> Optional[int]:
+        """
+        Returns the number of optimizer steps recorded in the optimizer state,
+        or None if the optimizer does not track a step count (e.g. plain SGD).
+
+        Raises:
+            RuntimeError: if the optimizer state records conflicting step counts
+                across parameters, indicating a corrupted checkpoint.
+        """
+        opt_state = self._optimizer.state_dict().get("state", {})
+        step_counts = {
+            int(param_state["step"])
+            for param_state in opt_state.values()
+            if "step" in param_state
+        }
+        if not step_counts:
+            return None
+        if len(step_counts) > 1:
+            raise RuntimeError(
+                "Inconsistent checkpoint: the optimizer state records conflicting "
+                f"step counts across parameters: {sorted(step_counts)}. The "
+                "checkpoint appears to be corrupted; training will not continue."
+            )
+        return step_counts.pop()
+
+    def _validate_resume_consistency(self, ckpt_dict: dict[str, Any]) -> None:
+        """
+        Validates that the training progress restored from the checkpoint is
+        self-consistent before training resumes. Three quantities are checked
+        against each other:
+
+        - the number of completed epochs (``epochs_run``),
+        - the number of optimizer steps recorded in the optimizer state,
+        - the number of scheduler steps, i.e. the step count the LR scheduler is
+          rebuilt with (``steps_run`` saved in the checkpoint, or derived from
+          ``epochs_run`` for checkpoints that do not record it).
+
+        Checkpoints saved by this recipe contain at most one epoch's worth of
+        optimizer steps beyond the completed epochs (mid-epoch checkpoints), so
+        anything outside of that range means the checkpoint is corrupted or was
+        tampered with. In that case a RuntimeError is raised and training does
+        not continue. Older valid checkpoints that do not record ``steps_run``
+        only undergo the checks that are possible for them and are otherwise
+        unaffected.
+        """
+        # Final checkpoints do not contain optimizer or recipe state, so there
+        # is nothing to validate
+        if training.OPT_KEY not in ckpt_dict:
+            return
+
+        opt_steps = self._optimizer_step_count()
+        completed_epoch_steps = self.epochs_run * self._steps_per_epoch
+        max_expected_steps = completed_epoch_steps + self._steps_per_epoch
+
+        if (
+            opt_steps is not None
+            and not completed_epoch_steps <= opt_steps <= max_expected_steps
+        ):
+            raise RuntimeError(
+                "Inconsistent checkpoint: the optimizer state records "
+                f"{opt_steps} steps, but {self.epochs_run} completed epochs with "
+                f"{self._steps_per_epoch} steps per epoch imply between "
+                f"{completed_epoch_steps} and {max_expected_steps} steps. The "
+                "checkpoint appears to be corrupted; training will not continue."
+            )
+
+        if self._steps_run_from_ckpt is not None:
+            if (
+                not completed_epoch_steps
+                <= self._steps_run_from_ckpt
+                <= max_expected_steps
+            ):
+                raise RuntimeError(
+                    "Inconsistent checkpoint: the recipe state records "
+                    f"{self._steps_run_from_ckpt} scheduler steps, but "
+                    f"{self.epochs_run} completed epochs with "
+                    f"{self._steps_per_epoch} steps per epoch imply between "
+                    f"{completed_epoch_steps} and {max_expected_steps} steps. The "
+                    "checkpoint appears to be corrupted; training will not continue."
+                )
+            if opt_steps is not None and self._steps_run_from_ckpt != opt_steps:
+                raise RuntimeError(
+                    "Inconsistent checkpoint: the recipe state records "
+                    f"{self._steps_run_from_ckpt} scheduler steps but the optimizer "
+                    f"state records {opt_steps} steps. The checkpoint appears to "
+                    "be corrupted; training will not continue."
+                )
+
+        self._logger.info(
+            "Checkpoint consistency check passed: "
+            f"epochs_run={self.epochs_run}, "
+            f"optimizer_steps={opt_steps}, "
+            f"scheduler_steps={self.global_step}."
+        )
 
     def setup(self, cfg: DictConfig) -> None:
         """
@@ -345,7 +459,16 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
             and self.max_steps_per_epoch < self._steps_per_epoch
         ):
             self._steps_per_epoch = self.max_steps_per_epoch
+        # If the number of steps run was not restored from the checkpoint, derive
+        # it from the number of completed epochs. This is also the step count the
+        # LR scheduler is rebuilt with below.
+        if self._steps_run_from_ckpt is None:
             self.global_step = self.epochs_run * self._steps_per_epoch
+
+        # Make sure the epoch count, optimizer step count and scheduler step count
+        # restored from the checkpoint are consistent before training continues
+        if self._resume_from_checkpoint:
+            self._validate_resume_consistency(checkpoint_dict)
 
         self.checkpoint_dir_prefix = ""
         if self.save_every_n_steps is None:
@@ -384,7 +507,9 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
             assert (
                 cfg_profiler.get("_component_")
                 == "torchtune.training.setup_torch_profiler"
-            ), "Only torch profiler supported currently: component must be `torchtune.training.setup_torch_profiler`"
+            ), (
+                "Only torch profiler supported currently: component must be `torchtune.training.setup_torch_profiler`"
+            )
 
         profiler, profiler_cfg = config.instantiate(cfg_profiler)
 
@@ -573,6 +698,8 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
                 total_epochs=self.total_epochs,
                 max_steps_per_epoch=self.max_steps_per_epoch,
                 dataloader_state_dict=self._dataloader.state_dict(),
+                steps_run=self.global_step,
+                total_training_steps=self.total_epochs * self._steps_per_epoch,
             ),
             epoch=epoch,
             adapter_config=self._adapter_config.copy(),
