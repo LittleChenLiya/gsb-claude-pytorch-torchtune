@@ -4,11 +4,13 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import copy
 import os
 import runpy
 import shutil
 import sys
 from pathlib import Path
+from typing import Optional
 
 import pytest
 import torch
@@ -17,6 +19,7 @@ from tests.common import TUNE_PATH
 from tests.recipes.utils import (
     CKPT_COMPONENT_MAP,
     dummy_alpaca_dataset_config,
+    lora_llama3_test_config,
     MODEL_TEST_CONFIGS,
     write_hf_ckpt_config,
 )
@@ -27,7 +30,7 @@ from tests.test_utils import (
     gpu_test,
     TOKENIZER_PATHS,
 )
-from torchtune import config
+from torchtune import config, training
 
 from torchtune.training.checkpointing._utils import (
     ADAPTER_MODEL_FNAME,
@@ -436,3 +439,300 @@ class TestLoRAFinetuneSingleDeviceRecipe:
         llama3_model.load_state_dict(sd)
         merged_ckpt_out = llama3_model(inputs)
         torch.testing.assert_close(baseline_out, merged_ckpt_out, rtol=1e-5, atol=1e-5)
+
+    # ------------------------------------------------------------------
+    # CPU resume step-consistency test
+    # ------------------------------------------------------------------
+
+    # Path to the tiny tiktoken tokenizer shipped with the test assets.
+    _TOKENIZER_PATH = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "assets",
+        "tiktoken_small.model",
+    )
+
+    @staticmethod
+    def _load_recipe_module():
+        """Load the LoRA recipe module directly.
+
+        The ``recipes/`` directory is not a package, so the recipe module
+        cannot be imported via a normal ``import`` statement. We load it
+        from the file path instead.
+        """
+        import importlib.util
+
+        recipe_path = os.path.join(
+            os.path.dirname(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            ),
+            "recipes",
+            "lora_finetune_single_device.py",
+        )
+        spec = importlib.util.spec_from_file_location(
+            "lora_finetune_single_device", recipe_path
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _build_tiny_lora_cfg(
+        self,
+        *,
+        output_dir,
+        base_ckpt_path,
+        epochs: int,
+        resume: bool = False,
+        adapter_checkpoint=None,
+        recipe_checkpoint=None,
+    ):
+        """Build a DictConfig for the tiny CPU LoRA recipe."""
+        from omegaconf import OmegaConf
+
+        # Convert pytest LocalPath objects to strings
+        output_dir = str(output_dir)
+        base_ckpt_path = str(base_ckpt_path)
+        ckpt_dir = str(Path(base_ckpt_path).parent)
+        if adapter_checkpoint is not None:
+            adapter_checkpoint = str(adapter_checkpoint)
+        if recipe_checkpoint is not None:
+            recipe_checkpoint = str(recipe_checkpoint)
+
+        cfg = OmegaConf.load("recipes/configs/llama3/8B_lora_single_device.yaml")
+        overrides = [
+            "dtype=fp32",
+            "dataset.train_on_input=False",
+            "seed=9",
+            f"epochs={epochs}",
+            "max_steps_per_epoch=2",
+            "batch_size=2",
+            "gradient_accumulation_steps=1",
+            "optimizer.lr=2e-5",
+            "log_every_n_steps=1",
+            f"output_dir={output_dir}",
+            # tiny llama3 LoRA model
+            "model._component_=torchtune.models.llama3.lora_llama3",
+            "model.vocab_size=128256",
+            "model.num_layers=2",
+            "model.num_heads=8",
+            "model.num_kv_heads=4",
+            "model.embed_dim=64",
+            "model.max_seq_len=1024",
+            "model.lora_rank=8",
+            "model.lora_alpha=16",
+            "model.lora_dropout=0.0",
+            "model.lora_attn_modules=[q_proj,v_proj]",
+            "model.apply_lora_to_mlp=False",
+            # tokenizer
+            f"tokenizer.path={self._TOKENIZER_PATH}",
+            "tokenizer.max_seq_len=256",
+            "tokenizer.prompt_template=null",
+            # dataset
+            "dataset._component_=torchtune.datasets.alpaca_dataset",
+            "dataset.source=json",
+            "dataset.data_files=tests/assets/alpaca_tiny.json",
+            "dataset.split=train",
+            # logging
+            f"metric_logger.filename={output_dir}/log.txt",
+            "enable_activation_checkpointing=False",
+            "enable_activation_offloading=False",
+        ]
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(overrides))
+
+        # Replace the checkpointer config entirely with a fresh one for
+        # FullModelTorchTuneCheckpointer (no config.json needed).
+        checkpointer_overrides = {
+            "_component_": "torchtune.training.FullModelTorchTuneCheckpointer",
+            "checkpoint_dir": ckpt_dir,
+            "checkpoint_files": [base_ckpt_path],
+            "output_dir": output_dir,
+            "model_type": "LLAMA3",
+        }
+        if resume:
+            checkpointer_overrides["resume_from_checkpoint"] = True
+            checkpointer_overrides["adapter_checkpoint"] = adapter_checkpoint
+            checkpointer_overrides["recipe_checkpoint"] = recipe_checkpoint
+            # The recipe reads the top-level resume_from_checkpoint flag,
+            # not the checkpointer's flag.
+            cfg.resume_from_checkpoint = True
+        cfg.checkpointer = OmegaConf.create(checkpointer_overrides)
+
+        return cfg
+
+    def _create_tiny_lora_base_checkpoint(self, ckpt_path) -> None:
+        """Create a tiny random base checkpoint for the llama3 LoRA model."""
+        from torchtune.models.llama3 import lora_llama3
+
+        with torch.device("cpu"):
+            model = lora_llama3(
+                lora_attn_modules=["q_proj", "v_proj"],
+                apply_lora_to_mlp=False,
+                apply_lora_to_output=False,
+                vocab_size=128_256,
+                num_layers=2,
+                num_heads=8,
+                num_kv_heads=4,
+                embed_dim=64,
+                max_seq_len=1024,
+                lora_rank=8,
+                lora_alpha=16,
+                lora_dropout=0.0,
+            )
+        torch.save(model.state_dict(), str(ckpt_path))
+
+    @pytest.mark.integration_test
+    def test_lora_resume_step_consistency_cpu(self, tmpdir):
+        """
+        Verify that resuming a LoRA recipe validates the consistency of the
+        epoch count, optimizer step count, and scheduler step count.
+
+        - Train a tiny LoRA model on CPU for 2 epochs (reference run).
+        - Resume from the epoch-1 checkpoint and verify the final adapter
+          weights match the reference run.
+        - Tamper with each of the step counts in the checkpoint and verify
+          that setup raises ``RuntimeError`` and training does not start.
+        """
+        recipe_module = self._load_recipe_module()
+        LoRAFinetuneRecipeSingleDevice = (
+            recipe_module.LoRAFinetuneRecipeSingleDevice
+        )
+
+        # --- Setup --------------------------------------------------------
+        ckpt_dir = tmpdir / "base_ckpt"
+        ckpt_dir.mkdir()
+        base_ckpt_path = ckpt_dir / "base_model.pt"
+        self._create_tiny_lora_base_checkpoint(base_ckpt_path)
+
+        # --- Reference run: 2 epochs straight -----------------------------
+        ref_dir = tmpdir / "ref"
+        ref_dir.mkdir()
+        ref_cfg = self._build_tiny_lora_cfg(
+            output_dir=ref_dir,
+            base_ckpt_path=base_ckpt_path,
+            epochs=2,
+        )
+        recipe = LoRAFinetuneRecipeSingleDevice(ref_cfg)
+        recipe.setup(ref_cfg)
+        recipe.train()
+
+        # --- Resume run part 1: 2 epochs ----------------------------------
+        res_dir = tmpdir / "res"
+        res_dir.mkdir()
+        res_cfg = self._build_tiny_lora_cfg(
+            output_dir=res_dir,
+            base_ckpt_path=base_ckpt_path,
+            epochs=2,
+        )
+        recipe = LoRAFinetuneRecipeSingleDevice(res_cfg)
+        recipe.setup(res_cfg)
+        recipe.train()
+
+        # --- Resume run part 2: resume from epoch_0 -----------------------
+        epoch_folder = get_largest_iter_folder(res_dir)
+        epoch_folder_minus_one = (
+            f"epoch_{int(epoch_folder.split('_')[-1]) - 1}"
+        )
+        res_dir2 = tmpdir / "res2"
+        res_dir2.mkdir()
+        resume_cfg = self._build_tiny_lora_cfg(
+            output_dir=res_dir2,
+            base_ckpt_path=base_ckpt_path,
+            epochs=2,
+            resume=True,
+            adapter_checkpoint=res_dir
+            / epoch_folder_minus_one
+            / f"{ADAPTER_MODEL_FNAME}.pt",
+            recipe_checkpoint=res_dir
+            / epoch_folder_minus_one
+            / "recipe_state.pt",
+        )
+        recipe = LoRAFinetuneRecipeSingleDevice(resume_cfg)
+        recipe.setup(resume_cfg)
+        recipe.train()
+
+        # --- Compare final adapter weights --------------------------------
+        # Use mmap=False so the file handle is released before the final
+        # resume run tries to save to the same path.
+        ref_adapter = safe_torch_load(
+            ref_dir / epoch_folder / f"{ADAPTER_MODEL_FNAME}.pt",
+            weights_only=True,
+            mmap=False,
+        )
+        res_adapter = safe_torch_load(
+            res_dir2 / epoch_folder / f"{ADAPTER_MODEL_FNAME}.pt",
+            weights_only=True,
+            mmap=False,
+        )
+        for key in ref_adapter:
+            torch.testing.assert_close(
+                ref_adapter[key],
+                res_adapter[key],
+                rtol=1e-5,
+                atol=1e-5,
+            )
+
+        # --- Tamper tests -------------------------------------------------
+        recipe_state_path = (
+            res_dir / epoch_folder_minus_one / "recipe_state.pt"
+        )
+        # Use mmap=False so the file handle is released before we overwrite it.
+        original_state = safe_torch_load(
+            recipe_state_path, weights_only=False, mmap=False
+        )
+
+        def _tamper_and_setup(tamper_fn):
+            """Tamper the recipe state, attempt setup, and restore."""
+            # Use deepcopy so nested dicts (e.g. optimizer state) are not
+            # shared with ``original_state``.
+            tampered = copy.deepcopy(original_state)
+            tamper_fn(tampered)
+            torch.save(tampered, str(recipe_state_path))
+            try:
+                tampered_cfg = self._build_tiny_lora_cfg(
+                    output_dir=res_dir2,
+                    base_ckpt_path=base_ckpt_path,
+                    epochs=2,
+                    resume=True,
+                    adapter_checkpoint=res_dir
+                    / epoch_folder_minus_one
+                    / f"{ADAPTER_MODEL_FNAME}.pt",
+                    recipe_checkpoint=recipe_state_path,
+                )
+                tampered_recipe = LoRAFinetuneRecipeSingleDevice(tampered_cfg)
+                with pytest.raises(RuntimeError, match="inconsistent"):
+                    tampered_recipe.setup(tampered_cfg)
+            finally:
+                torch.save(original_state, str(recipe_state_path))
+
+        # Tamper the epoch count
+        _tamper_and_setup(
+            lambda s: s.update({training.EPOCHS_KEY: 99})
+        )
+
+        # Tamper the recorded step count
+        _tamper_and_setup(
+            lambda s: s.update({training.STEPS_KEY: 99})
+        )
+
+        # Tamper the optimizer state's step counter
+        def _tamper_optimizer_step(s):
+            for param_state in s[training.OPT_KEY]["state"].values():
+                if "step" in param_state:
+                    param_state["step"] = param_state["step"] + 100
+
+        _tamper_and_setup(_tamper_optimizer_step)
+
+        # --- Restore original and verify resume still works --------------
+        torch.save(original_state, str(recipe_state_path))
+        valid_cfg = self._build_tiny_lora_cfg(
+            output_dir=res_dir2,
+            base_ckpt_path=base_ckpt_path,
+            epochs=2,
+            resume=True,
+            adapter_checkpoint=res_dir
+            / epoch_folder_minus_one
+            / f"{ADAPTER_MODEL_FNAME}.pt",
+            recipe_checkpoint=recipe_state_path,
+        )
+        valid_recipe = LoRAFinetuneRecipeSingleDevice(valid_cfg)
+        valid_recipe.setup(valid_cfg)
+        valid_recipe.train()
